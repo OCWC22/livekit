@@ -793,6 +793,275 @@ LiveKit makes these tradeoffs configurable via `pkg/sfu/buffer/` and BWE:
 | **FEC** | +10% bandwidth | Medium | Moderate loss |
 | **Opus PLC** | None | Conceals 1-2 packets | Always for audio |
 
+## Why Go? Language Choice and Tradeoffs
+
+LiveKit is written in **Go** instead of C++, Rust, or Java. This wasn't arbitrary—it's a deliberate architectural decision optimized for LiveKit's specific workload.
+
+### The Key Insight: SFUs Are I/O-Bound, Not CPU-Bound
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  WHERE DOES TIME GO IN A MEDIA SERVER (SFU)?                    │
+└─────────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────┐
+  │                                                            │
+  │   Network I/O          ████████████████████████  85%       │
+  │   (waiting for packets)                                    │
+  │                                                            │
+  │   Packet routing       ████                      10%       │
+  │   (forwarding logic)                                       │
+  │                                                            │
+  │   CPU processing       █                          5%       │
+  │   (actual computation)                                     │
+  │                                                            │
+  └────────────────────────────────────────────────────────────┘
+
+  LiveKit does NOT encode/decode media (that's the CPU-heavy part)
+  It just ROUTES packets from publisher → subscribers
+  This is I/O-bound, not CPU-bound!
+```
+
+**Critical distinction:**
+- **MCU (Multipoint Control Unit)**: Decodes, mixes, re-encodes → CPU-intensive → C++/Rust beneficial
+- **SFU (Selective Forwarding Unit)**: Forwards packets as-is → I/O-intensive → Go is optimal
+
+### What LiveKit Actually Does with Audio
+
+```
+  Publisher                    LiveKit (SFU)                 Subscribers
+     │                              │                              │
+     │   Opus packet ──────────────►│                              │
+     │   (already encoded by        │                              │
+     │    browser/client)           │                              │
+     │                              │──── Forward same bytes ─────►│
+     │                              │──── Forward same bytes ─────►│
+     │                              │──── Forward same bytes ─────►│
+     │                              │                              │
+     
+  NO TRANSCODING! Just forwarding bytes.
+  The 10% performance gain from C++/Rust doesn't matter here.
+```
+
+### Language Comparison for SFU Workload
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  LANGUAGE TRADEOFFS FOR MEDIA SERVERS (SFU)                     │
+└─────────────────────────────────────────────────────────────────┘
+
+                    │ C++      │ Rust     │ Go       │ Java
+────────────────────┼──────────┼──────────┼──────────┼──────────
+Raw Performance     │ ★★★★★   │ ★★★★★   │ ★★★★☆   │ ★★★☆☆
+Memory Safety       │ ★★☆☆☆   │ ★★★★★   │ ★★★★☆   │ ★★★★☆
+Development Speed   │ ★★☆☆☆   │ ★★★☆☆   │ ★★★★★   │ ★★★★☆
+Concurrency Model   │ ★★★☆☆   │ ★★★★☆   │ ★★★★★   │ ★★★☆☆
+WebRTC Libraries    │ ★★★★★   │ ★★★☆☆   │ ★★★★★   │ ★★☆☆☆
+Deployment          │ ★★★☆☆   │ ★★★★★   │ ★★★★★   │ ★★☆☆☆
+Hiring/Maintenance  │ ★★☆☆☆   │ ★★★☆☆   │ ★★★★★   │ ★★★★★
+────────────────────┴──────────┴──────────┴──────────┴──────────
+```
+
+### Why NOT Each Alternative?
+
+**C++ - Too Dangerous, Too Slow to Develop:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  C++ DOWNSIDES                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ✗ Memory bugs (use-after-free, buffer overflows)              │
+│    → Security vulnerabilities in network-facing code           │
+│                                                                 │
+│  ✗ Much slower development (3-5x longer to write)              │
+│                                                                 │
+│  ✗ Complex build systems (CMake, cross-platform hell)          │
+│                                                                 │
+│  When C++ IS used:                                              │
+│  → Encoding/decoding (FFmpeg, libvpx, libopus)                 │
+│  → Browser WebRTC (Chrome's native implementation)             │
+│  → When you need every last CPU cycle                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Rust - Great Language, But Ecosystem Wasn't Ready:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  RUST DOWNSIDES (for this use case, in 2020-2021)              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ✗ No mature WebRTC library at the time                        │
+│    → webrtc-rs existed but wasn't production-ready             │
+│    → Pion (Go) was battle-tested in production                 │
+│                                                                 │
+│  ✗ Steeper learning curve                                      │
+│    → Harder to hire, slower onboarding                         │
+│                                                                 │
+│  ✗ Slower iteration speed                                      │
+│    → Fighting the borrow checker during rapid development      │
+│                                                                 │
+│  Note: Today Rust would be more viable (ecosystem matured)     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Java - Wrong Tool for Real-Time Systems:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  JAVA DOWNSIDES                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ✗ JVM startup time and memory overhead                        │
+│    → Go binary: ~20MB, starts in milliseconds                  │
+│    → Java: 200MB+ heap, slower cold start                      │
+│                                                                 │
+│  ✗ Garbage collection pauses                                   │
+│    → Can cause latency spikes in real-time systems             │
+│    → Go's GC is designed for low-latency (<1ms pauses)         │
+│                                                                 │
+│  ✗ No good WebRTC libraries in Java ecosystem                  │
+│                                                                 │
+│  ✗ Verbose code, slower iteration                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Why Go is Optimal for LiveKit
+
+**1. Goroutines = Perfect for Network I/O**
+
+Each connection needs its own processing loop. Go makes this trivial:
+
+```go
+// Handle 10,000+ concurrent connections easily
+for {
+    conn, _ := listener.Accept()
+    go handleConnection(conn)  // Spawn lightweight goroutine
+}
+
+// Each goroutine uses ~2KB stack (vs ~1MB for OS thread)
+// Can run millions of goroutines on one server
+```
+
+**2. Pion - Battle-Tested WebRTC in Go**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PION WebRTC Library                                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  • Pure Go implementation of WebRTC (no C dependencies)        │
+│  • Used in production by Discord, Cloudflare, and others       │
+│  • Active development, excellent community                     │
+│  • LiveKit is built directly on top of Pion                    │
+│                                                                 │
+│  This was THE deciding factor - Pion existed and worked.       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**3. Simple Deployment**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  DEPLOYMENT COMPARISON                                          │
+└─────────────────────────────────────────────────────────────────┘
+
+  Go:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  $ go build -o livekit-server                                │
+  │  $ ./livekit-server                                          │
+  │                                                              │
+  │  Single binary, no dependencies, runs anywhere               │
+  │  Docker image: ~20MB                                         │
+  └──────────────────────────────────────────────────────────────┘
+
+  Java:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  $ mvn package                                               │
+  │  $ java -jar -Xmx2g -XX:+UseG1GC ... server.jar             │
+  │                                                              │
+  │  Needs JVM, tuning, more memory                              │
+  │  Docker image: 200MB+                                        │
+  └──────────────────────────────────────────────────────────────┘
+
+  C++:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  $ cmake .. && make                                          │
+  │  $ ./server  (hope you have the right .so files...)         │
+  │                                                              │
+  │  Dependency hell, different builds per platform              │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+### Performance Reality Check for Audio Streaming
+
+For 16 kHz PCM audio specifically, here's why Go's performance is more than sufficient:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  16 kHz AUDIO PERFORMANCE REQUIREMENTS                          │
+└─────────────────────────────────────────────────────────────────┘
+
+  Per audio stream:
+  • 50 packets/second (one every 20ms)
+  • ~82 bytes per packet (RTP header + Opus payload)
+  • ~4 kbps per stream
+  
+  For 1000 concurrent audio streams:
+  • 50,000 packets/second
+  • 4 Mbps total bandwidth
+  
+  Go can easily handle:
+  • 1,000,000+ packets/second per core
+  • Network card becomes bottleneck before CPU
+  
+  ┌────────────────────────────────────────────────────────────┐
+  │  The "10% faster" from C++/Rust doesn't matter when:       │
+  │  • You're I/O bound, not CPU bound                         │
+  │  • Network latency (50-200ms) is 100x your processing time │
+  │  • Development speed and safety matter more                │
+  └────────────────────────────────────────────────────────────┘
+```
+
+### What IS Written in C/C++ (and Should Be)
+
+The CPU-intensive codec work is still done in C/C++, but on the **client side**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  COMPONENTS WRITTEN IN C/C++                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  libopus     → Audio encoding/decoding (Opus codec)            │
+│  libvpx      → Video encoding/decoding (VP8/VP9)               │
+│  libaom      → Video encoding (AV1)                            │
+│  OpenH264    → Video encoding (H.264)                          │
+│  libsrtp     → Encryption (SRTP)                               │
+│                                                                 │
+│  These run in the BROWSER or MOBILE APP (client-side)          │
+│  The SFU server doesn't encode/decode - it just forwards!      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Summary: Go Tradeoff Decision
+
+| Factor | Winner | Why It Matters for LiveKit |
+|--------|--------|---------------------------|
+| **Raw speed** | C++/Rust | Only 10-20% faster, not needed for I/O-bound SFU |
+| **Development speed** | **Go** | 3-5x faster to iterate, ship features |
+| **WebRTC ecosystem** | **Go (Pion)** | Battle-tested, production-ready |
+| **Concurrency** | **Go** | Goroutines perfectly match connection-per-client model |
+| **Memory safety** | Go/Rust | Prevents security vulnerabilities |
+| **Deployment** | **Go** | Single binary, Docker-friendly |
+| **Hiring** | **Go** | Easier to find devs than Rust/C++ |
+
+**Bottom line:** For an I/O-bound SFU handling audio/video forwarding, Go's tradeoffs are nearly optimal. The 10% performance gain from Rust/C++ isn't worth the 3-5x slower development and harder maintenance.
+
+---
+
 ## Architectural Decisions: Hard to Change Later
 
 | Decision | Why It's Hard to Change | LiveKit's Choice |
@@ -1005,6 +1274,7 @@ LAYER 2 - CODE (Engineer View)
 LAYER 3 - ARCHITECTURE (CTO View)
 ┌─────────────────────────────────────────────────────────────────────┐
 │  SFU architecture: Forward, don't mix (O(N) not O(N²))             │
+│  Why Go: I/O-bound workload, Pion WebRTC, goroutines, fast deploy  │
 │  Multi-node: Redis coordination, room affinity, migration          │
 │  Reliability: NACK, FEC, adaptive jitter buffer, PLC               │
 │  Scalability: Add nodes, StreamAllocator, per-subscriber quality   │
@@ -1030,7 +1300,7 @@ Total latency: < 150ms (sound waves to eardrums across the internet)
 |----------|------------------|
 | **Intern** | Sound → numbers → compression → packets → network → sound. Latency matters. |
 | **Engineer** | RTP/RTCP protocols, dual WebSocket+WebRTC paths, NACK/FEC reliability, Go codebase with Pion |
-| **CTO** | SFU scales, bandwidth dominates cost, Redis coordinates nodes, migration handles failures |
+| **CTO** | SFU scales, Go chosen because I/O-bound (not CPU-bound), Pion WebRTC mature, bandwidth dominates cost |
 | **CEO** | Enables $B market (video calls), open source = no lock-in, AI integration is differentiator |
 
 ---
