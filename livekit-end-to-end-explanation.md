@@ -182,6 +182,221 @@ Packets received: 1  2     4  5  6        9  10
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
+## What is an SFU and Why Do We Need It?
+
+When multiple people want to video chat, there's a fundamental problem: **how does everyone see everyone else?**
+
+### Option 1: Peer-to-Peer (No Server)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PEER-TO-PEER: Everyone connects to everyone                   │
+└─────────────────────────────────────────────────────────────────┘
+
+         Alice ◄──────────────────────► Bob
+           │ \                         / │
+           │   \                     /   │
+           │     \                 /     │
+           │       \             /       │
+           │         \         /         │
+           │           \     /           │
+           │             \ /             │
+           │             / \             │
+           │           /     \           │
+           │         /         \         │
+           │       /             \       │
+           │     /                 \     │
+           │   /                     \   │
+           │ /                         \ │
+         Dana ◄──────────────────────► Charlie
+
+  Each person uploads their video 3 times (once per other person)
+  
+  4 people = 6 connections
+  10 people = 45 connections  
+  20 people = 190 connections  ← BREAKS!
+```
+
+**Problems:**
+- Your upload bandwidth is multiplied by number of participants
+- Your laptop uploads the same video 3 times (wasteful!)
+- Doesn't scale past 4-5 people
+- If someone has bad internet, everyone suffers
+
+### Option 2: MCU (Server Mixes Everything)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  MCU: Server decodes all video, mixes into one, re-encodes     │
+└─────────────────────────────────────────────────────────────────┘
+
+         Alice                              Bob
+            \                              /
+             \    ┌──────────────────┐    /
+              ───►│                  │◄───
+                  │   MCU SERVER     │
+                  │                  │
+                  │  1. Decode all   │
+                  │  2. Mix together │
+                  │  3. Re-encode    │
+                  │  4. Send to each │
+              ◄───│                  │───►
+             /    └──────────────────┘    \
+            /                              \
+         Dana                            Charlie
+
+  Everyone uploads once ✓
+  Everyone downloads one mixed video ✓
+  
+  BUT: Server does HEAVY CPU work (decode + mix + encode)
+```
+
+**Problems:**
+- Server needs massive CPU (decode 10 videos, mix, re-encode 10 times)
+- Adds 100-300ms latency (encoding takes time)
+- Everyone sees the same layout (no flexibility)
+- Very expensive servers ($$$)
+- Scales to maybe 10-20 people max per server
+
+### Option 3: SFU (Just Forward, Don't Mix) ← LiveKit uses this!
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  SFU: Server just forwards packets (no decoding!)              │
+└─────────────────────────────────────────────────────────────────┘
+
+         Alice                              Bob
+            \                              /
+             \    ┌──────────────────┐    /
+              ───►│                  │◄───
+                  │   SFU SERVER     │
+                  │                  │
+                  │  Just forward!   │
+                  │  No decoding     │
+                  │  No mixing       │
+                  │  No re-encoding  │
+              ◄───│                  │───►
+             /    └──────────────────┘    \
+            /                              \
+         Dana                            Charlie
+
+  Alice uploads ONCE → Server forwards copies to Bob, Charlie, Dana
+  
+  Server just copies bytes. Super fast. Super cheap.
+```
+
+**How it works:**
+```
+Alice's video packet arrives at server:
+  [encrypted video data: 0x48A3F2...]
+  
+Server does NOT:
+  ✗ Decrypt it
+  ✗ Decode it  
+  ✗ Understand what's in it
+  ✗ Mix it with other videos
+  
+Server ONLY:
+  ✓ Copies the bytes
+  ✓ Sends copy to Bob
+  ✓ Sends copy to Charlie  
+  ✓ Sends copy to Dana
+```
+
+### Why SFU Wins
+
+| Factor | Peer-to-Peer | MCU | SFU |
+|--------|-------------|-----|-----|
+| **Upload bandwidth** | 3x (send to each person) | 1x | 1x |
+| **Server CPU** | None | VERY HIGH | Very low |
+| **Latency added** | None | +100-300ms | ~1ms |
+| **Max participants** | 4-5 | 10-20 | 100-500+ |
+| **Cost** | Free | $$$ | $ |
+| **Flexibility** | High | Low (same view) | High |
+
+### Real Example: 10-Person Call
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PEER-TO-PEER (no server)                                       │
+├─────────────────────────────────────────────────────────────────┤
+│  Each person uploads video 9 times                              │
+│  Your 2 Mbps video × 9 = 18 Mbps upload needed                 │
+│  Most home internet can't do this!                              │
+│  Total connections: 45 (N×(N-1)/2)                              │
+│  Result: FAILS                                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  MCU (mixing server)                                            │
+├─────────────────────────────────────────────────────────────────┤
+│  Server decodes 10 videos simultaneously                        │
+│  Server mixes into 10 different compositions                    │
+│  Server encodes 10 output videos                                │
+│  CPU needed: ~40 cores for 10 people                           │
+│  Latency added: 200ms+                                          │
+│  Result: EXPENSIVE, SLOW                                        │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  SFU (forwarding server) ← LiveKit                              │
+├─────────────────────────────────────────────────────────────────┤
+│  Each person uploads once (2 Mbps)                              │
+│  Server receives 10 × 2 = 20 Mbps                               │
+│  Server forwards: each person gets 9 streams = 18 Mbps          │
+│  Total outbound: 10 × 18 = 180 Mbps                            │
+│  CPU needed: ~1 core (just copying bytes)                       │
+│  Latency added: <1ms                                            │
+│  Result: WORKS GREAT                                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### What If We Had No SFU?
+
+| Scenario | What Happens |
+|----------|-------------|
+| **5+ person call** | Peer-to-peer breaks (too many connections) |
+| **Webinar (1 speaker, 100 viewers)** | Impossible without server |
+| **Recording** | Can't record without server in the middle |
+| **Different quality per viewer** | Impossible (everyone gets same) |
+| **Mobile user on 3G** | Can't reduce quality just for them |
+
+### Simple Analogy: The Mail System
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  MAIL ANALOGY                                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+  PEER-TO-PEER = You personally deliver a letter to each friend
+    → 10 friends = 10 trips
+    → Exhausting!
+
+  MCU = Post office opens every letter, repackages them all 
+        into one combined letter, then delivers
+    → Slow (reading + rewriting)
+    → Expensive (staff to read/write)
+    → Everyone gets same combined letter
+
+  SFU = Post office just photocopies your letter and delivers
+        copies to each friend
+    → Fast (just copying)
+    → Cheap (no reading/writing)
+    → Each friend gets their own copy
+```
+
+### SFU Summary
+
+| Question | Answer |
+|----------|--------|
+| **What is SFU?** | A server that forwards video/audio without decoding it |
+| **Why do we need it?** | Peer-to-peer doesn't scale past 4-5 people |
+| **What problem does it solve?** | Lets 100+ people video chat without massive bandwidth/CPU |
+| **What if we don't have it?** | Large calls are impossible, or very expensive (MCU) |
+| **What are alternatives?** | Peer-to-peer (small groups only) or MCU (expensive, slow) |
+
+**LiveKit = SFU** → Scales to hundreds of participants, low latency, low cost.
+
 ---
 
 # 2️⃣ Engineer View: Code and Implementation
